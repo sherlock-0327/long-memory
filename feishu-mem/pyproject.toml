@@ -1,0 +1,52 @@
+[tool.poetry]
+name = "feishu-mem"
+version = "0.1.0"
+description = "企业级长程协作Memory系统 - 飞书CLI高频命令与工作流记忆工具"
+authors = ["Team <team@example.com>"]
+readme = "README.md"
+packages = [{ include = "feishu_mem", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+click = "^8.1.7"
+sqlite-utils = "^3.35"
+chromadb = "^0.4.18"
+shlex = "^2.0.0"
+pygit2 = "^1.14.0"
+pydantic = "^2.5.2"
+python-dotenv = "^1.0.0"
+tqdm = "^4.66.1"
+regex = "^2023.12.25"
+numpy = "^1.26.2"
+sentence-transformers = "^2.2.2"
+jinja2 = "^3.1.2"
+platformdirs = "^4.1.0"
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.3"
+pytest-cov = "^4.1.0"
+black = "^23.11.0"
+ruff = "^0.1.7"
+mypy = "^1.7.1"
+
+[tool.poetry.scripts]
+mem = "feishu_mem.cli.main:cli"
+mem-worker = "feishu_mem.worker:main"
+
+[tool.black]
+line-length = 120
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+select = ["E", "F", "I", "UP", "S", "B", "A", "C4", "SIM", "ARG", "PTH"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
