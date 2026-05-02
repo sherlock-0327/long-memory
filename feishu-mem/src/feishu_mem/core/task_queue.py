@@ -146,23 +146,23 @@ class AsyncTaskQueue:
                 """, (now, self.worker_id, task_id))
                 
                 conn.commit()
-                
-                # 构造Task对象
+
+                # 构造Task对象（状态已更新为processing）
                 task = Task(
                     task_id=row["task_id"],
                     task_type=row["task_type"],
                     payload=json.loads(row["payload"]),
-                    status=TaskStatus(row["status"]),
+                    status=TaskStatus.PROCESSING,
                     priority=row["priority"],
                     retries=row["retries"],
                     max_retries=row["max_retries"],
                     created_at=row["created_at"],
-                    claimed_at=row["claimed_at"],
+                    claimed_at=now,
                     completed_at=row["completed_at"],
                     last_error=row["last_error"],
-                    worker_id=row["worker_id"]
+                    worker_id=self.worker_id,
                 )
-                
+
                 logger.debug(f"Task claimed: {task_id}, type: {task.task_type}, worker: {self.worker_id}")
                 return task
                 
@@ -284,6 +284,35 @@ class AsyncTaskQueue:
             logger.error("Failed to recover stuck tasks", exception=e)
             return 0
     
+    def get_task(self, task_id: str) -> Optional[Task]:
+        """获取指定任务的当前状态"""
+        try:
+            with sqlite3.connect(self.db_path, timeout=5) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    "SELECT * FROM task_queue WHERE task_id = ?", (task_id,)
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return Task(
+                    task_id=row["task_id"],
+                    task_type=row["task_type"],
+                    payload=json.loads(row["payload"]),
+                    status=TaskStatus(row["status"]),
+                    priority=row["priority"],
+                    retries=row["retries"],
+                    max_retries=row["max_retries"],
+                    created_at=row["created_at"],
+                    claimed_at=row["claimed_at"],
+                    completed_at=row["completed_at"],
+                    last_error=row["last_error"],
+                    worker_id=row["worker_id"],
+                )
+        except Exception as e:
+            logger.error(f"Failed to get task {task_id}", exception=e)
+            return None
+
     def get_dead_tasks(self, limit: int = 100) -> List[Task]:
         """获取死信队列中的任务"""
         try:
@@ -379,3 +408,54 @@ def get_task_queue() -> AsyncTaskQueue:
     if _task_queue is None:
         _task_queue = AsyncTaskQueue()
     return _task_queue
+
+
+class TaskWorker:
+    """任务执行Worker，轮询队列并分发任务给注册的处理器"""
+
+    def __init__(self, queue: AsyncTaskQueue, worker_id: str = None):
+        self.queue = queue
+        self.worker_id = worker_id or queue.worker_id
+        self.handlers: Dict[str, Callable] = {}
+        self._running = False
+
+    def register_handler(self, task_type: str, handler: Callable) -> None:
+        """注册任务类型对应的处理器"""
+        self.handlers[task_type] = handler
+
+    def start(self, poll_interval: float = 1.0) -> None:
+        """开始轮询并执行任务"""
+        self._running = True
+        logger.info(f"TaskWorker {self.worker_id} started, polling every {poll_interval}s")
+
+        while self._running:
+            try:
+                task = self.queue.claim_next()
+                if task:
+                    self._execute_task(task)
+                else:
+                    time.sleep(poll_interval)
+            except Exception as e:
+                logger.error("TaskWorker poll error", exception=e)
+                time.sleep(poll_interval)
+
+    def stop(self) -> None:
+        """停止Worker"""
+        self._running = False
+        logger.info(f"TaskWorker {self.worker_id} stopping")
+
+    def _execute_task(self, task: Task) -> None:
+        """执行单个任务"""
+        handler = self.handlers.get(task.task_type)
+        if not handler:
+            logger.warning(f"No handler for task type: {task.task_type}, marking as failed")
+            self.queue.mark_failed(task.task_id, f"No handler for task type: {task.task_type}")
+            return
+
+        try:
+            result = handler(task.payload)
+            self.queue.confirm(task.task_id, result)
+            logger.debug(f"Task {task.task_id} ({task.task_type}) completed successfully")
+        except Exception as e:
+            logger.error(f"Task {task.task_id} ({task.task_type}) failed", exception=e)
+            self.queue.mark_failed(task.task_id, str(e))

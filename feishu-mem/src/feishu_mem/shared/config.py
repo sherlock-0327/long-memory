@@ -52,7 +52,7 @@ class Config:
     embedding_device: str = "cpu"  # 可选cuda/mps
     vector_search_enabled: bool = True
     vector_search_limit: int = 10
-    vector_search_min_score: float = 0.5  # 最低匹配得分
+    vector_search_min_score: float = 0.2  # 最低匹配得分
     
     def __post_init__(self):
         """初始化后处理"""

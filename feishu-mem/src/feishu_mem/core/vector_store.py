@@ -13,7 +13,7 @@ from chromadb.utils import embedding_functions
 from feishu_mem.core.storage import CommandRecord
 from feishu_mem.shared.config import config
 from feishu_mem.shared.logger import logger
-from feishu_mem.shared.cache import l1_cache
+from feishu_mem.shared.cache import get_l1_cache
 
 class VectorStore:
     def __init__(self, persist_directory: Optional[Path] = None):
@@ -82,6 +82,35 @@ class VectorStore:
         except Exception as e:
             logger.error("Failed to add command to vector store", exception=e, command_id=record.command_id)
             return None
+    
+    def delete_command(self, command_id: str) -> bool:
+        """从向量数据库删除指定命令"""
+        try:
+            self.collection.delete(ids=[command_id])
+            logger.debug(f"Deleted command from vector store: {command_id}")
+            
+            # 失效相关缓存
+            get_l1_cache().invalidate_pattern("completion:")
+            return True
+        except Exception as e:
+            logger.error("Failed to delete command from vector store", exception=e, command_id=command_id)
+            return False
+
+    def update_command_metadata(self, command_id: str, metadata: Dict[str, Any]) -> bool:
+        """更新命令的元数据"""
+        try:
+            self.collection.update(
+                ids=[command_id],
+                metadatas=[metadata]
+            )
+            logger.debug(f"Updated command metadata in vector store: {command_id}, metadata: {metadata.keys()}")
+
+            # 失效相关缓存
+            get_l1_cache().invalidate_pattern("completion:")
+            return True
+        except Exception as e:
+            logger.error("Failed to update command metadata in vector store", exception=e, command_id=command_id)
+            return False
     
     def batch_add_commands(self, records: List[CommandRecord]) -> List[str]:
         """批量添加命令到向量数据库"""
@@ -171,29 +200,6 @@ class VectorStore:
         except Exception as e:
             logger.error("Failed to search commands in vector store", exception=e, query=query)
             return []
-    
-    def delete_command(self, command_id: str) -> bool:
-        """从向量库删除命令"""
-        try:
-            self.collection.delete(ids=[command_id])
-            logger.debug(f"Deleted command from vector store, id: {command_id}")
-            return True
-        except Exception as e:
-            logger.error("Failed to delete command from vector store", exception=e, command_id=command_id)
-            return False
-    
-    def update_command_metadata(self, command_id: str, metadata: Dict[str, Any]) -> bool:
-        """更新命令的元数据"""
-        try:
-            self.collection.update(
-                ids=[command_id],
-                metadatas=[metadata]
-            )
-            logger.debug(f"Updated command metadata in vector store, id: {command_id}")
-            return True
-        except Exception as e:
-            logger.error("Failed to update command metadata in vector store", exception=e, command_id=command_id)
-            return False
     
     def count(self) -> int:
         """获取向量库中的命令数量"""

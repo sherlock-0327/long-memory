@@ -19,11 +19,16 @@ from feishu_mem.core.version_manager import VersionManager, get_version_manager
 def test_storage():
     with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as f:
         db_path = Path(f.name)
-    
+
     storage = Storage(db_path=db_path)
     yield storage
-    
-    db_path.unlink(missing_ok=True)
+
+    import gc
+    gc.collect()
+    try:
+        db_path.unlink(missing_ok=True)
+    except PermissionError:
+        pass
 
 
 @pytest.fixture

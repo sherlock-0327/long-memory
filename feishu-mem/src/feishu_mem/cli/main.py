@@ -178,6 +178,214 @@ def hook(raw_command, exit_code, execution_time, start_time, end_time):
         logger.debug("Hook execution failed", exception=e, command=raw_command[:50])
         sys.exit(0)
 
+@cli.command()
+@click.argument("command_id")
+@click.option("--command", "-c", help="新的命令内容")
+@click.option("--description", "-d", help="命令描述")
+@click.option("--tags", "-t", multiple=True, help="标签")
+def edit(command_id, command, description, tags):
+    """编辑已记忆的命令"""
+    try:
+        records = storage.get_commands_by_ids([command_id])
+        if not records:
+            click.echo(f"❌ 未找到ID为 {command_id} 的命令")
+            sys.exit(1)
+        
+        record = records[0]
+        
+        # 更新字段
+        if command:
+            # 重新解析命令
+            parsed = collector.parse_command(command)
+            record.raw_command = command
+            record.command_name = parsed.command_name
+            record.arguments = parsed.arguments
+            record.options = parsed.options
+        
+        if description:
+            # 描述暂时保存在tags里或者新增字段，先存在tags里
+            if not record.tags:
+                record.tags = []
+            record.tags = [t for t in record.tags if not t.startswith("desc:")]
+            record.tags.append(f"desc:{description}")
+        
+        if tags:
+            record.tags = list(tags)
+        
+        # 更新到数据库
+        storage.update_command(record)
+        click.echo("✅ 命令已更新！")
+        click.echo(f"命令: {record.raw_command}")
+        
+    except Exception as e:
+        click.echo(f"❌ 编辑失败：{str(e)}", err=True)
+        sys.exit(1)
+
+@cli.command()
+@click.argument("command_id")
+@click.confirmation_option(prompt="确定要删除这条命令吗？")
+def delete(command_id):
+    """删除已记忆的命令"""
+    try:
+        deleted = storage.delete_command(command_id, vector_store=vector_store)
+        if deleted > 0:
+            click.echo(f"✅ 命令 {command_id} 已删除")
+        else:
+            click.echo(f"❌ 未找到ID为 {command_id} 的命令")
+            sys.exit(1)
+    except Exception as e:
+        click.echo(f"❌ 删除失败：{str(e)}", err=True)
+        sys.exit(1)
+
+@cli.group()
+def workflow():
+    """工作流管理命令"""
+    pass
+
+@workflow.command("list")
+@click.option("--all", "-a", is_flag=True, help="显示所有共享工作流")
+def workflow_list(all):
+    """列出可用工作流"""
+    try:
+        from feishu_mem.core.workflow import get_workflow_engine
+        engine = get_workflow_engine(storage)
+        
+        if all:
+            workflows = engine.list_workflows(include_shared=True)
+        else:
+            workflows = engine.list_workflows(user_id=os.getenv("USER") or os.getenv("USERNAME") or "unknown")
+        
+        if not workflows:
+            click.echo("还没有可用的工作流")
+            return
+        
+        click.echo(f"找到 {len(workflows)} 个工作流：")
+        for i, wf in enumerate(workflows, 1):
+            shared = " 🔄" if wf.is_shared else ""
+            click.echo(f"{i:2d}. {wf.name}{shared} (步骤: {len(wf.steps)}, 使用次数: {wf.usage_count})")
+            if wf.description:
+                click.echo(f"     描述: {wf.description}")
+    except Exception as e:
+        click.echo(f"❌ 获取工作流列表失败：{str(e)}", err=True)
+        sys.exit(1)
+
+@workflow.command("run")
+@click.argument("name")
+@click.option("--param", "-p", multiple=True, help="参数，格式: key=value")
+@click.option("--dry-run", is_flag=True, help="只预览执行计划，不实际执行")
+def workflow_run(name, param, dry_run):
+    """执行工作流"""
+    try:
+        from feishu_mem.core.workflow import get_workflow_engine
+        engine = get_workflow_engine(storage)
+        
+        workflow = engine.get_workflow_by_name(name)
+        if not workflow:
+            click.echo(f"❌ 未找到名为 {name} 的工作流")
+            sys.exit(1)
+        
+        # 解析参数
+        params = {}
+        for p in param:
+            if "=" in p:
+                key, value = p.split("=", 1)
+                params[key.strip()] = value.strip()
+        
+        click.echo(f"🚀 开始执行工作流: {workflow.name}")
+        if params:
+            click.echo(f"参数: {params}")
+        
+        result = engine.execute_workflow(workflow.workflow_id, parameters=params, dry_run=dry_run)
+        
+        if dry_run:
+            click.echo("\n📋 执行计划:")
+            for step in result.step_results:
+                click.echo(f"  {step['step_id']}: {step['command']}")
+            return
+        
+        click.echo(f"\n执行结果: {'✅ 成功' if result.status == 'completed' else '❌ 失败'}")
+        click.echo(f"总耗时: {(result.end_time - result.start_time).total_seconds():.2f}秒")
+        
+        for step in result.step_results:
+            status_icon = "✅" if step["status"] == "completed" else "❌" if step["status"] == "failed" else "⏭️"
+            click.echo(f"\n{status_icon} {step['step_id']}: {step['command']}")
+            if step["status"] == "failed":
+                click.echo(f"   错误: {step.get('error', '未知错误')}")
+            elif step["status"] == "completed" and step.get("stdout"):
+                click.echo(f"   输出: {step['stdout'][:200]}")
+        
+        if result.status == "failed":
+            click.echo(f"\n❌ 工作流执行失败: {result.error_message}")
+            sys.exit(1)
+        
+    except Exception as e:
+        click.echo(f"❌ 工作流执行失败：{str(e)}", err=True)
+        sys.exit(1)
+
+@cli.command()
+def stats():
+    """查看系统统计指标"""
+    try:
+        from feishu_mem.shared.metrics import get_metrics
+        metrics = get_metrics().get_metrics()
+
+        click.echo("📊 系统统计指标")
+        click.echo(f"运行时间: {int(metrics['system']['uptime_seconds']/3600)}小时 {int(metrics['system']['uptime_seconds']%3600/60)}分钟")
+        click.echo("")
+
+        click.echo("🔢 核心指标:")
+        click.echo(f"  命令采集总数: {metrics['counter']['command_collected_total']['value']}")
+        click.echo(f"  命令存储总数: {metrics['counter']['command_added_total']['value']}")
+        click.echo(f"  补全请求总数: {metrics['counter']['completion_requests_total']['value']}")
+        click.echo(f"  缓存命中率: {metrics['gauge']['cache_l1_hit_rate']['value']:.1%}")
+        click.echo(f"  工作流执行总数: {metrics['counter']['workflow_executions_total']['value']}")
+        click.echo(f"  工作流成功率: {metrics['counter']['workflow_executions_success_total']['value'] / max(metrics['counter']['workflow_executions_total']['value'], 1):.1%}")
+        click.echo("")
+
+        click.echo("⚡ 性能指标:")
+        if metrics['histogram']['completion_duration_seconds']['count'] > 0:
+            avg_completion = metrics['histogram']['completion_duration_seconds']['sum'] / metrics['histogram']['completion_duration_seconds']['count']
+            click.echo(f"  平均补全响应时间: {avg_completion*1000:.1f}ms")
+
+        if metrics['histogram']['command_add_duration_seconds']['count'] > 0:
+            avg_add = metrics['histogram']['command_add_duration_seconds']['sum'] / metrics['histogram']['command_add_duration_seconds']['count']
+            click.echo(f"  平均命令存储时间: {avg_add*1000:.1f}ms")
+
+        # 补全引擎上下文经济学
+        if completion_engine:
+            eco = completion_engine.get_economics()
+            click.echo("")
+            click.echo("💡 补全效率统计:")
+            click.echo(f"  总查询次数: {eco['total_queries']}")
+            click.echo(f"  缓存命中次数: {eco['cache_hits']}")
+            click.echo(f"  缓存命中率: {eco['cache_hit_rate_percent']:.1f}%")
+            click.echo(f"  输入字符总数: {eco['total_chars_input']}")
+            click.echo(f"  推荐字符总数: {eco['total_chars_suggested']}")
+            click.echo(f"  字符节省率: {eco['char_savings_rate_percent']:.1f}%")
+
+    except Exception as e:
+        click.echo(f"❌ 获取统计信息失败：{str(e)}", err=True)
+        sys.exit(1)
+
+@cli.command()
+def cleanup():
+    """手动清理过期记忆"""
+    try:
+        from feishu_mem.core.forgetting_engine import get_forgetting_engine
+        engine = get_forgetting_engine()
+        
+        click.echo("🧹 开始清理过期记忆...")
+        deleted_expired = engine.auto_cleanup_expired_memory()
+        deleted_low_value = engine.forget_low_value_memory()
+        
+        click.echo(f"✅ 清理完成：")
+        click.echo(f"  过期记忆删除: {deleted_expired} 条")
+        click.echo(f"  低价值记忆遗忘: {deleted_low_value} 条")
+        
+    except Exception as e:
+        click.echo(f"❌ 清理失败：{str(e)}", err=True)
+        sys.exit(1)
+
 @cli.command(hidden=True)
 @click.argument("prefix", required=False)
 def completion(prefix=""):
@@ -187,8 +395,6 @@ def completion(prefix=""):
             return
         
         # 获取上下文信息
-        from feishu_mem.core.collector import CommandCollector
-        collector = CommandCollector()
         context = collector.extract_context()
         
         completions = completion_engine.get_completions(
@@ -210,26 +416,11 @@ def version():
     """显示版本信息"""
     import importlib.metadata
     try:
-        version = importlib.metadata.version("feishu-mem")
+        ver = importlib.metadata.version("feishu-mem")
     except importlib.metadata.PackageNotFoundError:
-        version = "dev"
-    click.echo(f"Feishu-Mem v{version}")
+        ver = "dev"
+    click.echo(f"Feishu-Mem v{ver}")
     click.echo("企业级长程协作Memory系统")
-
-@cli.command()
-def stats():
-    """显示记忆统计信息"""
-    try:
-        if not storage:
-            click.echo("存储未初始化")
-            return
-        
-        # TODO: 实现统计功能
-        click.echo("统计功能开发中...")
-        
-    except Exception as e:
-        click.echo(f"❌ 获取统计信息失败：{str(e)}", err=True)
-        sys.exit(1)
 
 if __name__ == "__main__":
     cli()

@@ -1,14 +1,16 @@
 from .config import config, Config, ConfigManager
 from .logger import logger, Logger
-from .cache import l1_cache, LRUCache, CacheItem
+from .cache import get_l1_cache, get_cache, LRUCache, CacheEntry, MultiLevelCache
 
 __all__ = [
     "config",
-    "Config", 
+    "Config",
     "ConfigManager",
     "logger",
     "Logger",
-    "l1_cache",
+    "get_l1_cache",
+    "get_cache",
     "LRUCache",
-    "CacheItem"
+    "CacheEntry",
+    "MultiLevelCache",
 ]

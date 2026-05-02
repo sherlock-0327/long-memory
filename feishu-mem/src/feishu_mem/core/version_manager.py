@@ -1,6 +1,7 @@
 import json
 import hashlib
 import sqlite3
+import uuid
 from datetime import datetime
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
@@ -66,7 +67,7 @@ class VersionManager:
     def create_version(self, record: CommandRecord, change_reason: str = "initial", created_by: str = "system") -> str:
         """创建新版本记录"""
         try:
-            version_id = hashlib.uuid4().hex
+            version_id = uuid.uuid4().hex
             content_hash = self.calculate_content_hash(record)
             
             with sqlite3.connect(self.db_path, timeout=5) as conn:
@@ -95,37 +96,62 @@ class VersionManager:
             logger.error("Failed to create version", exception=e)
             return ""
     
+    @staticmethod
+    def _compute_confidence(record: CommandRecord) -> float:
+        """根据CommandRecord可用字段计算置信度"""
+        base = 0.8 if record.is_explicit else 0.5
+        if record.is_successful:
+            base *= 1.2
+        return min(base, 1.0)
+
+    @staticmethod
+    def _compute_feedback_score(record: CommandRecord) -> float:
+        """根据CommandRecord可用字段计算反馈评分"""
+        score = 1.0 if record.is_successful else 0.0
+        if record.is_explicit:
+            score += 0.5
+        return min(score, 1.5)
+
     def resolve_conflict(self, existing: CommandRecord, new: CommandRecord) -> Tuple[CommandRecord, str]:
         """
         解决冲突，返回优胜的记忆项和原因
         优先级：
         1. 时间戳更新优先
-        2. 置信度更高优先
-        3. 用户反馈评分更高优先
-        4. 使用次数更多优先
+        2. 显式记忆优先（is_explicit）
+        3. 使用次数更多优先
+        4. 成功执行优先
         """
         reasons = []
-        
+
+        new_confidence = self._compute_confidence(new)
+        existing_confidence = self._compute_confidence(existing)
+        new_feedback = self._compute_feedback_score(new)
+        existing_feedback = self._compute_feedback_score(existing)
+
         # 规则1：时间戳优先
-        if new.executed_at > existing.executed_at:
+        if new.executed_at and existing.executed_at and new.executed_at > existing.executed_at:
             reasons.append(f"新记录时间戳更新 ({new.executed_at} > {existing.executed_at})")
             winner = new
-        # 规则2：置信度优先
-        elif new.confidence > existing.confidence:
-            reasons.append(f"新记录置信度更高 ({new.confidence} > {existing.confidence})")
+        # 规则2：显式记忆优先
+        elif new.is_explicit and not existing.is_explicit:
+            reasons.append("新记录为显式记忆，优先级更高")
             winner = new
-        # 规则3：用户反馈优先
-        elif new.user_feedback_score > existing.user_feedback_score:
-            reasons.append(f"新记录用户反馈更高 ({new.user_feedback_score} > {existing.user_feedback_score})")
+        # 规则3：置信度优先
+        elif new_confidence > existing_confidence:
+            reasons.append(f"新记录置信度更高 ({new_confidence:.2f} > {existing_confidence:.2f})")
             winner = new
-        # 规则4：使用次数优先
+        # 规则4：用户反馈优先
+        elif new_feedback > existing_feedback:
+            reasons.append(f"新记录反馈评分更高 ({new_feedback:.2f} > {existing_feedback:.2f})")
+            winner = new
+        # 规则5：使用次数优先
         elif new.usage_count > existing.usage_count:
             reasons.append(f"新记录使用次数更多 ({new.usage_count} > {existing.usage_count})")
             winner = new
         else:
             reasons.append("现有记录各项指标更优")
             winner = existing
-        
+
         reason = " | ".join(reasons)
         logger.debug(f"Conflict resolved: {reason}, winner command: {winner.raw_command[:50]}")
         return winner, reason
@@ -164,8 +190,30 @@ class VersionManager:
     def rollback_to_version(self, command_id: str, version_id: str) -> bool:
         """回滚到指定版本"""
         try:
+            # 先在目标命令的版本历史中查找
             versions = self.get_version_history(command_id)
             target_version = next((v for v in versions if v.version_id == version_id), None)
+
+            # 如果没找到，跨所有版本记录查找（支持跨命令回滚）
+            if not target_version:
+                with sqlite3.connect(self.db_path, timeout=5) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.execute(
+                        "SELECT * FROM memory_versions WHERE version_id = ?", (version_id,)
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        target_version = MemoryVersion(
+                            version_id=row["version_id"],
+                            command_id=row["command_id"],
+                            content_hash=row["content_hash"],
+                            content=json.loads(row["content"]),
+                            created_at=datetime.fromisoformat(row["created_at"]),
+                            created_by=row["created_by"],
+                            change_reason=row["change_reason"],
+                            confidence=row["confidence"],
+                            user_feedback_score=row["user_feedback_score"]
+                        )
             
             if not target_version:
                 logger.error(f"Version {version_id} not found for command {command_id}")
@@ -217,7 +265,37 @@ class VersionManager:
                 conn.commit()
             
             # 创建新版本记录回滚操作
-            record = CommandRecord(**content)
+            # JSON中的datetime是字符串，需要转换回datetime对象
+            def _parse_dt(val):
+                if isinstance(val, str) and val:
+                    try:
+                        return datetime.fromisoformat(val)
+                    except ValueError:
+                        return None
+                return val
+
+            record = CommandRecord(
+                command_id=command_id,
+                raw_command=content.get("raw_command", ""),
+                command_name=content.get("command_name", ""),
+                arguments=content.get("arguments", []),
+                options=content.get("options", {}),
+                working_dir=content.get("working_dir", ""),
+                session_id=content.get("session_id"),
+                project_id=content.get("project_id"),
+                environment=content.get("environment"),
+                exit_code=content.get("exit_code"),
+                execution_time=content.get("execution_time"),
+                executed_at=_parse_dt(content.get("executed_at")),
+                user_id=content.get("user_id"),
+                source=content.get("source", "shell"),
+                tags=content.get("tags"),
+                is_successful=content.get("is_successful", True),
+                sensitivity_level=content.get("sensitivity_level", "public"),
+                is_explicit=content.get("is_explicit", False),
+                usage_count=content.get("usage_count", 1),
+                last_used_at=_parse_dt(content.get("last_used_at")),
+            )
             self.create_version(record, change_reason=f"rollback to version {version_id}")
             
             logger.info(f"Rolled back command {command_id} to version {version_id}")

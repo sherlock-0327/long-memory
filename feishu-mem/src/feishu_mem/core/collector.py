@@ -33,11 +33,12 @@ class SensitiveFilter:
     def __init__(self):
         self.patterns = {
             'password': re.compile(r'(?:password|passwd|pwd)\s*=\s*[^\s]+', re.I),
-            'token': re.compile(r'(?:api[_-]?key|token|secret|bearer)\s*[=:]\s*[^\s]+', re.I),
+            'password_flag': re.compile(r'-p\S+', re.I),
             'private_key': re.compile(r'-----BEGIN (?:RSA|DSA|EC|OPENSSH) PRIVATE KEY-----[\s\S]*?-----END (?:RSA|DSA|EC|OPENSSH) PRIVATE KEY-----', re.I),
             'aws_key': re.compile(r'AKIA[0-9A-Z]{16}', re.I),
             'credential': re.compile(r'(?:-u\s+\S+\s+-p\s+\S+|--user\s+\S+\s+--password\s+\S+)', re.I),
-            'authorization': re.compile(r'Authorization:\s*[^\s]+', re.I),
+            'token': re.compile(r'(?:api[_-]?key|token|secret|bearer)\s*[=:]\s*[^\s]+', re.I),
+            'authorization': re.compile(r'Authorization:\s*\S+\s+\S+', re.I),
             'phone': re.compile(r'1[3-9]\d{9}'),
             'email': re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'),
         }
@@ -86,10 +87,14 @@ class SensitiveFilter:
     
     def _mask_value(self, value: str, pattern_type: str) -> str:
         """根据敏感类型进行不同的脱敏处理"""
-        if pattern_type in ['password', 'token', 'private_key', 'authorization']:
-            return f'***{pattern_type.upper()}_HIDDEN***'
+        if pattern_type in ['password', 'password_flag', 'token', 'private_key', 'authorization']:
+            return '***PASSWORD_HIDDEN***' if 'password' in pattern_type else f'***{pattern_type.upper()}_HIDDEN***'
         elif pattern_type in ['phone', 'email']:
             return f'***{pattern_type.upper()}_HIDDEN***'
+        elif pattern_type in ['credential']:
+            return '***CREDENTIAL_HIDDEN***'
+        elif pattern_type in ['aws_key']:
+            return '***AWS_KEY_HIDDEN***'
         return re.sub(r'([=:]\s*)\S+', r'\1***', value)
 
 class CommandCollector:
@@ -176,7 +181,7 @@ class CommandCollector:
             # 使用getattr安全访问shorthand属性，避免detached HEAD等场景抛出异常
             context.git_branch = getattr(repo.head, 'shorthand', None)
             # 用Git仓库URL的SHA-256哈希作为项目ID，减少哈希冲突风险
-            if "origin" in repo.remotes:
+            if "origin" in repo.remotes.names():
                 origin_url = repo.remotes["origin"].url
                 url_hash = hashlib.sha256(origin_url.encode()).hexdigest()[:16]
                 context.project_id = f"proj_{url_hash}"

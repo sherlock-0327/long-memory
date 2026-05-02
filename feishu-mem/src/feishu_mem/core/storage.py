@@ -41,12 +41,19 @@ class Storage:
         logger.info(f"Storage initialized, database path: {self.db_path}")
     
     def _init_db(self) -> None:
-        """初始化数据库表结构"""
+        """初始化数据库表结构，应用生产级PRAGMA优化"""
         schema_path = Path(__file__).parent / "schema.sql"
         with open(schema_path, "r", encoding="utf-8") as f:
             schema = f.read()
-        
+
         with sqlite3.connect(self.db_path, timeout=5) as conn:
+            # 生产级SQLite优化（参考claude-mem架构）
+            conn.execute("PRAGMA journal_mode=WAL")  # 写前日志，并发读写
+            conn.execute("PRAGMA synchronous=NORMAL")  # 平衡安全与性能
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA temp_store=MEMORY")  # 临时表存储在内存
+            conn.execute("PRAGMA mmap_size=67108864")  # 64MB mmap加速
+            conn.execute("PRAGMA cache_size=5000")  # 5000页缓存
             conn.executescript(schema)
             conn.commit()
     
@@ -54,13 +61,37 @@ class Storage:
         """计算命令内容哈希，用于去重
         对参数和选项进行排序，确保相同命令无论参数顺序如何都生成相同哈希
         """
-        # 对列表参数排序
         sorted_args = sorted(record.arguments)
-        # 对字典选项按键排序
         sorted_options = dict(sorted(record.options.items())) if record.options else {}
         
         content = f"{record.command_name}{json.dumps(sorted_args)}{json.dumps(sorted_options)}{record.project_id}{record.environment}"
         return hashlib.sha256(content.encode()).hexdigest()[:16]
+    
+    @staticmethod
+    def _row_to_record(row) -> CommandRecord:
+        """将sqlite3.Row转换为CommandRecord对象，消除重复代码"""
+        return CommandRecord(
+            command_id=row["command_id"],
+            session_id=row["session_id"],
+            raw_command=row["raw_command"],
+            command_name=row["command_name"],
+            arguments=json.loads(row["arguments"]) if row["arguments"] else [],
+            options=json.loads(row["options"]) if row["options"] else {},
+            working_dir=row["working_dir"],
+            project_id=row["project_id"],
+            environment=row["environment"],
+            exit_code=row["exit_code"],
+            execution_time=row["execution_time"],
+            executed_at=datetime.fromisoformat(row["executed_at"]) if row["executed_at"] else None,
+            user_id=row["user_id"],
+            source=row["source"],
+            tags=json.loads(row["tags"]) if row["tags"] else [],
+            is_successful=bool(row["is_successful"]),
+            sensitivity_level=row["sensitivity_level"],
+            is_explicit=bool(row["is_explicit"]),
+            usage_count=row["usage_count"],
+            last_used_at=datetime.fromisoformat(row["last_used_at"]) if row["last_used_at"] else None,
+        )
     
     def add_command(self, record: CommandRecord, vector_store=None) -> Optional[str]:
         """添加命令记录，存在相同哈希则更新使用次数，失败时返回None不崩溃"""
@@ -80,13 +111,29 @@ class Storage:
             record.command_id = str(uuid.uuid4()) if not record.command_id else record.command_id
             record.executed_at = datetime.now() if not record.executed_at else record.executed_at
             record.last_used_at = datetime.now() if not record.last_used_at else record.last_used_at
-            
+
             with sqlite3.connect(self.db_path, timeout=5) as conn:
-                # 检查是否已存在相同哈希的记录
-                cursor = conn.execute(
-                    "SELECT command_id, usage_count FROM commands WHERE content_hash = ? AND project_id = ? AND environment = ?",
-                    (content_hash, record.project_id, record.environment)
-                )
+                # 检查是否已存在相同哈希的记录（NULL-safe比较）
+                if record.project_id is None and record.environment is None:
+                    cursor = conn.execute(
+                        "SELECT command_id, usage_count FROM commands WHERE content_hash = ? AND project_id IS NULL AND environment IS NULL",
+                        (content_hash,)
+                    )
+                elif record.project_id is None:
+                    cursor = conn.execute(
+                        "SELECT command_id, usage_count FROM commands WHERE content_hash = ? AND project_id IS NULL AND environment = ?",
+                        (content_hash, record.environment)
+                    )
+                elif record.environment is None:
+                    cursor = conn.execute(
+                        "SELECT command_id, usage_count FROM commands WHERE content_hash = ? AND project_id = ? AND environment IS NULL",
+                        (content_hash, record.project_id)
+                    )
+                else:
+                    cursor = conn.execute(
+                        "SELECT command_id, usage_count FROM commands WHERE content_hash = ? AND project_id = ? AND environment = ?",
+                        (content_hash, record.project_id, record.environment)
+                    )
                 existing = cursor.fetchone()
                 
                 if existing:
@@ -124,8 +171,9 @@ class Storage:
                         INSERT INTO commands (
                             command_id, session_id, raw_command, command_name, arguments, options, working_dir,
                             project_id, environment, exit_code, execution_time, executed_at,
-                            user_id, source, tags, is_successful, sensitivity_level, content_hash, is_explicit, last_used_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            user_id, source, tags, is_successful, sensitivity_level, content_hash, is_explicit, last_used_at,
+                            usage_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             record.command_id,
@@ -147,7 +195,8 @@ class Storage:
                             record.sensitivity_level,
                             content_hash,
                             1 if record.is_explicit else 0,
-                            record.last_used_at.isoformat()
+                            record.last_used_at.isoformat(),
+                            record.usage_count,
                         )
                     )
                     conn.commit()
@@ -172,7 +221,43 @@ class Storage:
         except Exception as e:
             logger.error("Failed to add command", exception=e, command=record.raw_command[:100])
             return None
-    
+
+    def update_command(self, record: CommandRecord) -> bool:
+        """更新已有的命令记录"""
+        try:
+            content_hash = self._calculate_content_hash(record)
+            with sqlite3.connect(self.db_path, timeout=5) as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE commands SET
+                        raw_command = ?, command_name = ?, arguments = ?, options = ?,
+                        working_dir = ?, project_id = ?, environment = ?, tags = ?,
+                        content_hash = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE command_id = ?
+                    """,
+                    (
+                        record.raw_command,
+                        record.command_name,
+                        json.dumps(record.arguments),
+                        json.dumps(record.options),
+                        record.working_dir,
+                        record.project_id,
+                        record.environment,
+                        json.dumps(record.tags) if record.tags else None,
+                        content_hash,
+                        record.command_id,
+                    ),
+                )
+                conn.commit()
+                if cursor.rowcount > 0:
+                    logger.debug(f"Command updated: {record.command_id}")
+                    return True
+                logger.warning(f"Command not found for update: {record.command_id}")
+                return False
+        except Exception as e:
+            logger.error("Failed to update command", exception=e, command_id=record.command_id)
+            return False
+
     def get_commands_by_ids(self, command_ids: List[str]) -> List[CommandRecord]:
         """根据ID列表批量获取命令记录"""
         if not command_ids:
@@ -189,35 +274,72 @@ class Storage:
                 command_ids
             )
             
-            records = []
-            for row in cursor.fetchall():
-                record = CommandRecord(
-                    command_id=row["command_id"],
-                    session_id=row["session_id"],
-                    raw_command=row["raw_command"],
-                    command_name=row["command_name"],
-                    arguments=json.loads(row["arguments"]) if row["arguments"] else [],
-                    options=json.loads(row["options"]) if row["options"] else {},
-                    working_dir=row["working_dir"],
-                    project_id=row["project_id"],
-                    environment=row["environment"],
-                    exit_code=row["exit_code"],
-                    execution_time=row["execution_time"],
-                    executed_at=datetime.fromisoformat(row["executed_at"]),
-                    user_id=row["user_id"],
-                    source=row["source"],
-                    tags=json.loads(row["tags"]) if row["tags"] else [],
-                    is_successful=bool(row["is_successful"]),
-                    sensitivity_level=row["sensitivity_level"],
-                    is_explicit=bool(row["is_explicit"]),
-                    usage_count=row["usage_count"],
-                    last_used_at=datetime.fromisoformat(row["last_used_at"])
-                )
-                records.append(record)
+            records = [self._row_to_record(row) for row in cursor.fetchall()]
             
-            # 保持与输入ID相同的顺序
             id_to_record = {r.command_id: r for r in records}
             return [id_to_record[id] for id in command_ids if id in id_to_record]
+    
+    def delete_command(self, command_id: str, vector_store=None) -> int:
+        """
+        删除指定命令记录
+        返回删除的行数，失败时返回0
+        """
+        try:
+            # 先写入WAL
+            wal = get_wal()
+            wal_entry_id = wal.append({
+                "type": "delete_command",
+                "command_id": command_id
+            })
+            
+            deleted_rows = 0
+            with sqlite3.connect(self.db_path, timeout=5) as conn:
+                # 删除主记录
+                cursor = conn.execute(
+                    "DELETE FROM commands WHERE command_id = ?",
+                    (command_id,)
+                )
+                deleted_rows = cursor.rowcount
+                conn.commit()
+                
+                if deleted_rows > 0:
+                    logger.info(f"Command deleted: {command_id}")
+                    
+                    # 删除向量库记录
+                    if vector_store and hasattr(vector_store, 'delete_command'):
+                        try:
+                            vector_store.delete_command(command_id)
+                        except Exception as vs_error:
+                            logger.warning("Failed to delete command from vector store", exception=vs_error, command_id=command_id)
+                    
+                    # 删除版本历史
+                    from .version_manager import get_version_manager
+                    try:
+                        version_manager = get_version_manager()
+                        version_manager.delete_version_history(command_id)
+                    except Exception as vm_error:
+                        logger.warning("Failed to delete command version history", exception=vm_error, command_id=command_id)
+                    
+                    # 失效相关缓存
+                    from feishu_mem.shared.cache import get_cache
+                    try:
+                        cache = get_cache()
+                        cache.invalidate("completion:")
+                    except Exception as cache_error:
+                        logger.warning("Failed to invalidate cache after command deletion", exception=cache_error)
+                
+                # 标记WAL条目为已完成
+                try:
+                    wal.mark_complete(wal_entry_id)
+                except Exception as wal_error:
+                    logger.error("Failed to mark WAL entry as complete for delete operation", 
+                               exception=wal_error, entry_id=wal_entry_id)
+                
+                return deleted_rows
+                
+        except Exception as e:
+            logger.error("Failed to delete command", exception=e, command_id=command_id)
+            return 0
     
     def cleanup_expired_memory(self) -> int:
         """清理过期记忆，返回删除的数量"""
@@ -304,131 +426,63 @@ class Storage:
                 params
             )
             
-            records = []
-            for row in cursor.fetchall():
-                record = CommandRecord(
-                    command_id=row["command_id"],
-                    raw_command=row["raw_command"],
-                    command_name=row["command_name"],
-                    arguments=json.loads(row["arguments"]) if row["arguments"] else [],
-                    options=json.loads(row["options"]) if row["options"] else {},
-                    working_dir=row["working_dir"],
-                    project_id=row["project_id"],
-                    environment=row["environment"],
-                    exit_code=row["exit_code"],
-                    execution_time=row["execution_time"],
-                    executed_at=datetime.fromisoformat(row["executed_at"]),
-                    user_id=row["user_id"],
-                    source=row["source"],
-                    tags=json.loads(row["tags"]) if row["tags"] else [],
-                    is_successful=bool(row["is_successful"]),
-                    sensitivity_level=row["sensitivity_level"],
-                    is_explicit=bool(row["is_explicit"]),
-                    usage_count=row["usage_count"]
-                )
-                records.append(record)
-            
-            return records
+            return [self._row_to_record(row) for row in cursor.fetchall()]
     
     def get_recent_commands(self, limit: int = 10) -> List[CommandRecord]:
         """获取最近使用的命令"""
-        with sqlite3.connect(self.db_path, timeout=5) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(
-                """
-                SELECT * FROM commands
-                ORDER BY last_used_at DESC
-                LIMIT ?
-                """,
-                (limit,)
-            )
-            
-            records = []
-            for row in cursor.fetchall():
-                record = CommandRecord(
-                    command_id=row["command_id"],
-                    raw_command=row["raw_command"],
-                    command_name=row["command_name"],
-                    arguments=json.loads(row["arguments"]) if row["arguments"] else [],
-                    options=json.loads(row["options"]) if row["options"] else {},
-                    working_dir=row["working_dir"],
-                    project_id=row["project_id"],
-                    environment=row["environment"],
-                    exit_code=row["exit_code"],
-                    execution_time=row["execution_time"],
-                    executed_at=datetime.fromisoformat(row["executed_at"]),
-                    user_id=row["user_id"],
-                    source=row["source"],
-                    tags=json.loads(row["tags"]) if row["tags"] else [],
-                    is_successful=bool(row["is_successful"]),
-                    sensitivity_level=row["sensitivity_level"],
-                    is_explicit=bool(row["is_explicit"]),
-                    usage_count=row["usage_count"],
-                    last_used_at=datetime.fromisoformat(row["last_used_at"])
+        try:
+            with sqlite3.connect(self.db_path, timeout=5) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    """
+                    SELECT * FROM commands
+                    ORDER BY last_used_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,)
                 )
-                records.append(record)
-            
-            return records
+                return [self._row_to_record(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error("Failed to get recent commands", exception=e)
+            return []
     
     def get_prefix_matches(self, prefix: str, project_id: Optional[str] = None, environment: Optional[str] = None, limit: int = 20) -> List[CommandRecord]:
         """前缀匹配命令，用于快速补全"""
-        params = []
-        conditions = []
-        
-        if project_id:
-            conditions.append("project_id = ?")
-            params.append(project_id)
-        
-        if environment:
-            conditions.append("environment = ?")
-            params.append(environment)
-        
-        # 前缀匹配规则：命令名或整个命令以前缀开头
-        conditions.append("(raw_command LIKE ? OR command_name LIKE ?)")
-        params.append(f"{prefix}%")
-        params.append(f"{prefix}%")
-        
-        where_clause = " AND ".join(conditions)
-        params.append(limit)
-        
-        with sqlite3.connect(self.db_path, timeout=5) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(
-                f"""
-                SELECT * FROM commands
-                WHERE {where_clause}
-                ORDER BY usage_count DESC, last_used_at DESC
-                LIMIT ?
-                """,
-                params
-            )
-            
-            records = []
-            for row in cursor.fetchall():
-                record = CommandRecord(
-                    command_id=row["command_id"],
-                    raw_command=row["raw_command"],
-                    command_name=row["command_name"],
-                    arguments=json.loads(row["arguments"]) if row["arguments"] else [],
-                    options=json.loads(row["options"]) if row["options"] else {},
-                    working_dir=row["working_dir"],
-                    project_id=row["project_id"],
-                    environment=row["environment"],
-                    exit_code=row["exit_code"],
-                    execution_time=row["execution_time"],
-                    executed_at=datetime.fromisoformat(row["executed_at"]),
-                    user_id=row["user_id"],
-                    source=row["source"],
-                    tags=json.loads(row["tags"]) if row["tags"] else [],
-                    is_successful=bool(row["is_successful"]),
-                    sensitivity_level=row["sensitivity_level"],
-                    is_explicit=bool(row["is_explicit"]),
-                    usage_count=row["usage_count"],
-                    last_used_at=datetime.fromisoformat(row["last_used_at"])
+        try:
+            params = []
+            conditions = []
+
+            if project_id:
+                conditions.append("project_id = ?")
+                params.append(project_id)
+
+            if environment:
+                conditions.append("environment = ?")
+                params.append(environment)
+
+            # 前缀匹配规则：命令名或整个命令以前缀开头
+            conditions.append("(raw_command LIKE ? OR command_name LIKE ?)")
+            params.append(f"{prefix}%")
+            params.append(f"{prefix}%")
+
+            where_clause = " AND ".join(conditions)
+            params.append(limit)
+
+            with sqlite3.connect(self.db_path, timeout=5) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    f"""
+                    SELECT * FROM commands
+                    WHERE {where_clause}
+                    ORDER BY usage_count DESC, last_used_at DESC
+                    LIMIT ?
+                    """,
+                    params
                 )
-                records.append(record)
-            
-            return records
+                return [self._row_to_record(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error("Failed to get prefix matches", exception=e)
+            return []
     
     def get_recent_command_sequences(self, project_id: Optional[str] = None, environment: Optional[str] = None, min_length: int = 2, limit: int = 100) -> List[List[CommandRecord]]:
         """获取最近的命令执行序列，用于工作流挖掘"""
@@ -459,30 +513,7 @@ class Storage:
                     params
                 )
                 
-                records = []
-                for row in cursor.fetchall():
-                    record = CommandRecord(
-                        command_id=row["command_id"],
-                        raw_command=row["raw_command"],
-                        command_name=row["command_name"],
-                        arguments=json.loads(row["arguments"]) if row["arguments"] else [],
-                        options=json.loads(row["options"]) if row["options"] else {},
-                        working_dir=row["working_dir"],
-                        project_id=row["project_id"],
-                        environment=row["environment"],
-                        exit_code=row["exit_code"],
-                        execution_time=row["execution_time"],
-                        executed_at=datetime.fromisoformat(row["executed_at"]),
-                        user_id=row["user_id"],
-                        source=row["source"],
-                        tags=json.loads(row["tags"]) if row["tags"] else [],
-                        is_successful=bool(row["is_successful"]),
-                        sensitivity_level=row["sensitivity_level"],
-                        is_explicit=bool(row["is_explicit"]),
-                        usage_count=row["usage_count"],
-                        last_used_at=datetime.fromisoformat(row["last_used_at"])
-                    )
-                    records.append(record)
+                records = [self._row_to_record(row) for row in cursor.fetchall()]
             
             # 按会话分组构建序列
             sequences = []

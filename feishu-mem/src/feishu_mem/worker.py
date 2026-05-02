@@ -55,21 +55,64 @@ class WorkerService:
         
         self.worker.register_handler("generate_embedding", handle_embedding_generation)
         
-        # 模式分析任务
+        # 模式分析任务：基于历史命令发现高频使用模式
         def handle_pattern_analysis(payload):
-            # TODO: 实现模式分析任务处理
+            from feishu_mem.core.storage import Storage
+            storage = Storage()
             user_id = payload.get("user_id", "unknown")
-            logger.debug(f"Running pattern analysis for user: {user_id}")
-            return {"status": "success"}
+            limit = payload.get("limit", 200)
+
+            recent = storage.get_recent_commands(limit=limit)
+            if not recent:
+                return {"status": "success", "patterns_found": 0}
+
+            # 统计命令名频率
+            from collections import Counter
+            cmd_counter = Counter(r.command_name for r in recent)
+            # 统计完整命令频率
+            full_counter = Counter(r.raw_command for r in recent if r.usage_count >= 2)
+
+            patterns = []
+            for cmd_name, count in cmd_counter.most_common(20):
+                patterns.append({"command": cmd_name, "count": count, "type": "command_name"})
+            for raw_cmd, count in full_counter.most_common(20):
+                patterns.append({"command": raw_cmd, "count": count, "type": "full_command"})
+
+            logger.info(f"Pattern analysis for user {user_id}: found {len(patterns)} patterns")
+            return {"status": "success", "patterns_found": len(patterns)}
         
         self.worker.register_handler("pattern_analysis", handle_pattern_analysis)
         
-        # 工作流发现任务
+        # 工作流发现任务：从命令序列中挖掘工作流
         def handle_workflow_discovery(payload):
-            # TODO: 实现工作流发现任务处理
+            from feishu_mem.core.storage import Storage
+            from feishu_mem.core.workflow import WorkflowEngine
+            storage = Storage()
             project_id = payload.get("project_id")
-            logger.debug(f"Discovering workflows for project: {project_id}")
-            return {"status": "success"}
+            min_length = payload.get("min_length", 2)
+            limit = payload.get("limit", 100)
+
+            sequences = storage.get_recent_command_sequences(
+                project_id=project_id, min_length=min_length, limit=limit
+            )
+            if not sequences:
+                return {"status": "success", "workflows_found": 0}
+
+            # 简单的序列频率统计
+            from collections import Counter
+            pair_counter: Counter = Counter()
+            for seq in sequences:
+                for i in range(len(seq) - 1):
+                    pair = (seq[i].command_name, seq[i + 1].command_name)
+                    pair_counter[pair] += 1
+
+            workflows = []
+            for (cmd_a, cmd_b), count in pair_counter.most_common(20):
+                if count >= 2:
+                    workflows.append({"from": cmd_a, "to": cmd_b, "count": count})
+
+            logger.info(f"Workflow discovery for project {project_id}: found {len(workflows)} workflows")
+            return {"status": "success", "workflows_found": len(workflows)}
         
         self.worker.register_handler("workflow_discovery", handle_workflow_discovery)
         
@@ -114,30 +157,25 @@ class WorkerService:
 
 def main():
     """主函数"""
+    import subprocess
+
     if len(sys.argv) > 1 and sys.argv[1] == "start":
-        # 后台运行
-        pid = os.fork()
-        if pid > 0:
-            print(f"Feishu-Mem Worker started in background, PID: {pid}")
-            sys.exit(0)
-        
-        # 子进程
-        os.setsid()
-        os.umask(0)
-        pid = os.fork()
-        if pid > 0:
-            sys.exit(0)
-        
-        # 重定向标准流
-        sys.stdout.flush()
-        sys.stderr.flush()
-        
-        with open('/dev/null', 'r') as dev_null:
-            os.dup2(dev_null.fileno(), sys.stdin.fileno())
-        with open(config.log_dir / "worker.log", 'a+') as f:
-            os.dup2(f.fileno(), sys.stdout.fileno())
-            os.dup2(f.fileno(), sys.stderr.fileno())
-    
+        # 跨平台后台运行：使用subprocess启动独立进程
+        log_path = config.log_dir / "worker.log"
+        config.log_dir.mkdir(parents=True, exist_ok=True)
+
+        with open(log_path, "a+", encoding="utf-8") as log_file:
+            process = subprocess.Popen(
+                [sys.executable, __file__],
+                stdout=log_file,
+                stderr=log_file,
+                stdin=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                start_new_session=True if os.name != "nt" else False,
+            )
+        print(f"Feishu-Mem Worker started in background, PID: {process.pid}")
+        sys.exit(0)
+
     # 启动服务
     service = WorkerService()
     service.run()
