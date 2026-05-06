@@ -6,9 +6,11 @@
 import chromadb
 import json
 import uuid
+import os
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from pathlib import Path
+from chromadb.config import Settings
 from chromadb.utils import embedding_functions
 
 from feishu_mem.core.storage import CommandRecord
@@ -19,10 +21,16 @@ from feishu_mem.shared.cache import get_l1_cache
 
 class VectorStore:
     def __init__(self, persist_directory: Optional[Path] = None):
+        os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+        os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
         self.persist_dir = persist_directory or config.vector_db_path
         self.persist_dir.mkdir(parents=True, exist_ok=True)
 
-        self.client = chromadb.PersistentClient(path=str(self.persist_dir))
+        self.client = chromadb.PersistentClient(
+            path=str(self.persist_dir),
+            settings=Settings(anonymized_telemetry=False),
+        )
 
         self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
             model_name=config.embedding_model_name,

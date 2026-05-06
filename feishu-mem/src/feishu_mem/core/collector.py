@@ -6,7 +6,11 @@ import uuid
 from typing import Tuple, List, Dict, Any, Optional
 from pathlib import Path
 from dataclasses import dataclass
-import pygit2
+
+try:
+    import pygit2
+except ImportError:  # optional fallback when Git metadata support is unavailable
+    pygit2 = None
 
 from feishu_mem.shared.config import config
 from feishu_mem.shared.logger import logger
@@ -177,6 +181,8 @@ class CommandCollector:
         
         # 提取Git分支信息
         try:
+            if pygit2 is None:
+                raise RuntimeError("pygit2 is not installed")
             repo = pygit2.Repository(working_dir)
             # 使用getattr安全访问shorthand属性，避免detached HEAD等场景抛出异常
             context.git_branch = getattr(repo.head, 'shorthand', None)
@@ -186,12 +192,19 @@ class CommandCollector:
                 url_hash = hashlib.sha256(origin_url.encode()).hexdigest()[:16]
                 context.project_id = f"proj_{url_hash}"
                 logger.debug(f"Git project detected: {context.project_id}, branch: {context.git_branch}")
-        except (pygit2.GitError, KeyError, AttributeError):
+        except (RuntimeError, KeyError, AttributeError):
             # 捕获更多异常类型：Git错误、键不存在、属性不存在
             # 不是Git仓库，用目录路径的SHA-256哈希作为项目ID
             path_hash = hashlib.sha256(working_dir.encode()).hexdigest()[:16]
             context.project_id = f"proj_{path_hash}"
             logger.debug(f"Non-Git project detected: {context.project_id}")
+        except Exception as e:
+            if pygit2 is not None and isinstance(e, pygit2.GitError):
+                path_hash = hashlib.sha256(working_dir.encode()).hexdigest()[:16]
+                context.project_id = f"proj_{path_hash}"
+                logger.debug(f"Non-Git project detected: {context.project_id}")
+            else:
+                raise
         
         # 提取环境变量
         context.environment = os.getenv("ENV") or os.getenv("ENVIRONMENT") or "dev"

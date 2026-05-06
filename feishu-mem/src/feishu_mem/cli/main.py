@@ -1,44 +1,112 @@
 import click
+import builtins
 import os
 import sys
-import traceback
-from pathlib import Path
-from datetime import datetime
-
-from feishu_mem.core.storage import Storage, CommandRecord
-from feishu_mem.core.collector import CommandCollector
-from feishu_mem.core.completion import CompletionEngine
-from feishu_mem.core.vector_store import VectorStore
-from feishu_mem.core.session_manager import get_session_manager
-from feishu_mem.cli.hooks.installer import HookInstaller
-from feishu_mem.shared.config import config
-from feishu_mem.shared.logger import logger
 
 # 全局实例，支持优雅降级
-try:
-    from feishu_mem.core.wal import get_wal
-    wal = get_wal()
+config = None
+logger = None
+CommandRecord = None
+storage = None
+vector_store = None
+wal = None
+collector = None
+completion_engine = None
+hook_installer = None
+session_mgr = None
+_wal_replayed = False
+_last_runtime_error = None
 
-    storage = Storage()
-    vector_store = VectorStore() if config.vector_search_enabled else None
 
-    wal.replay_incomplete(storage, vector_store)
+def _ensure_runtime(include_vector: bool = False) -> bool:
+    """Initialize only the runtime pieces required by the current command."""
+    global config, logger, CommandRecord
+    global storage, vector_store, wal, collector, completion_engine
+    global hook_installer, session_mgr, _wal_replayed, _last_runtime_error
 
-    collector = CommandCollector()
-    completion_engine = CompletionEngine(storage, vector_store)
-    hook_installer = HookInstaller()
-    session_mgr = get_session_manager()
+    try:
+        _last_runtime_error = None
+        if config is None:
+            from feishu_mem.shared.config import config as loaded_config
 
-    logger.info("Feishu-Mem CLI initialized successfully")
-except Exception as e:
-    logger.error("Failed to initialize Feishu-Mem", exception=e)
-    storage = None
-    vector_store = None
-    wal = None
-    collector = None
-    completion_engine = None
-    hook_installer = None
-    session_mgr = None
+            config = loaded_config
+
+        if logger is None:
+            from feishu_mem.shared.logger import logger as loaded_logger
+
+            logger = loaded_logger
+
+        if wal is None:
+            from feishu_mem.core.wal import get_wal
+
+            wal = get_wal()
+
+        if storage is None:
+            from feishu_mem.core.storage import CommandRecord as LoadedCommandRecord
+            from feishu_mem.core.storage import Storage
+
+            CommandRecord = LoadedCommandRecord
+            storage = Storage()
+
+        if collector is None:
+            from feishu_mem.core.collector import CommandCollector
+
+            collector = CommandCollector()
+
+        if hook_installer is None:
+            from feishu_mem.cli.hooks.installer import HookInstaller
+
+            hook_installer = HookInstaller()
+
+        if session_mgr is None:
+            from feishu_mem.core.session_manager import get_session_manager
+
+            session_mgr = get_session_manager()
+
+        if include_vector and vector_store is None and config.vector_search_enabled:
+            from feishu_mem.core.vector_store import VectorStore
+
+            vector_store = VectorStore()
+
+        if include_vector and completion_engine is None:
+            from feishu_mem.core.completion import CompletionEngine
+
+            completion_engine = CompletionEngine(storage, vector_store)
+
+        if not _wal_replayed:
+            wal.replay_incomplete(storage, vector_store)
+            _wal_replayed = True
+
+        return True
+    except Exception as e:
+        _last_runtime_error = e
+        if logger is not None:
+            logger.error("Failed to initialize Feishu-Mem runtime", exception=e)
+        return False
+
+
+def _require_runtime(include_vector: bool = False) -> None:
+    if not _ensure_runtime(include_vector=include_vector):
+        detail = f"：{_last_runtime_error}" if _last_runtime_error else ""
+        click.echo(f"Feishu-Mem 初始化失败{detail}。请检查配置、数据目录和依赖安装。", err=True)
+        sys.exit(1)
+
+
+def _parse_extra_tags(args):
+    tags = []
+    tokens = builtins.list(args)
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token in ("--tags", "-t"):
+            if i + 1 >= len(tokens):
+                raise click.UsageError(f"{token} 需要提供标签值")
+            tags.append(tokens[i + 1])
+            i += 2
+        else:
+            i += 1
+
+    return tuple(tags)
 
 @click.group()
 def cli():
@@ -47,6 +115,7 @@ def cli():
 
 @cli.command()
 def install():
+    _require_runtime()
     """安装Shell钩子，开启命令自动采集"""
     try:
         hook_installer.install()
@@ -59,6 +128,7 @@ def install():
 
 @cli.command()
 def uninstall():
+    _require_runtime()
     """卸载Shell钩子"""
     try:
         hook_installer.uninstall()
@@ -73,6 +143,7 @@ def uninstall():
 @click.option("--project", "-p", help="指定项目ID")
 @click.option("--env", "-e", help="指定环境")
 def search(query, limit, project, env):
+    _require_runtime()
     """搜索历史命令"""
     try:
         results = storage.search_commands(query, project_id=project, environment=env, limit=limit)
@@ -83,19 +154,22 @@ def search(query, limit, project, env):
         click.echo(f"找到 {len(results)} 条匹配命令：")
         for i, record in enumerate(results, 1):
             env_info = f" [{record.environment}]" if record.environment else ""
-            explicit = " ⭐" if record.is_explicit else ""
+            explicit = " [explicit]" if record.is_explicit else ""
             click.echo(f"{i:2d}. {record.raw_command}{env_info}{explicit} (使用次数: {record.usage_count})")
     except Exception as e:
         click.echo(f"❌ 搜索失败：{str(e)}", err=True)
         sys.exit(1)
 
-@cli.command()
+@cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("command")
 @click.argument("description", required=False)
 @click.option("--tags", "-t", multiple=True, help="标签")
-def teach(command, description, tags):
+@click.pass_context
+def teach(ctx, command, description, tags):
+    _require_runtime()
     """主动教学记忆命令"""
     try:
+        tags = tuple(tags) + _parse_extra_tags(ctx.args)
         parsed, context, filtered_command = collector.collect(command, is_explicit=True)
         
         record = CommandRecord(
@@ -108,20 +182,21 @@ def teach(command, description, tags):
             project_id=context.project_id,
             environment=context.environment,
             user_id=context.user_id,
-            tags=list(tags),
+            tags=builtins.list(tags),
             is_explicit=True
         )
         
         command_id = storage.add_command(record)
-        click.echo(f"✅ 命令已记忆！ID: {command_id}")
+        click.echo(f"命令已记忆！ID: {command_id}")
         click.echo(f"命令: {filtered_command}")
     except Exception as e:
-        click.echo(f"❌ 记忆失败：{str(e)}", err=True)
+        click.echo(f"记忆失败：{str(e)}", err=True)
         sys.exit(1)
 
 @cli.command()
 @click.option("--limit", "-l", default=10, help="显示数量")
 def list(limit):
+    _require_runtime()
     """列出最近使用的命令"""
     try:
         records = storage.get_recent_commands(limit=limit)
@@ -133,7 +208,7 @@ def list(limit):
         for i, record in enumerate(records, 1):
             time_str = record.executed_at.strftime("%m-%d %H:%M")
             env_info = f" [{record.environment}]" if record.environment else ""
-            explicit = " ⭐" if record.is_explicit else ""
+            explicit = " [explicit]" if record.is_explicit else ""
             click.echo(f"{i:2d}. [{time_str}] {record.raw_command}{env_info}{explicit}")
     except Exception as e:
         click.echo(f"❌ 获取命令列表失败：{str(e)}", err=True)
@@ -146,6 +221,8 @@ def list(limit):
 @click.option("--start-time", type=int, help="命令开始时间戳(秒)")
 @click.option("--end-time", type=int, help="命令结束时间戳(秒)")
 def hook(raw_command, exit_code, execution_time, start_time, end_time):
+    if not _ensure_runtime():
+        sys.exit(0)
     """Shell钩子调用的命令采集接口（内部使用）"""
     # 钩子执行必须保证绝对不崩溃，不影响用户正常使用
     try:
@@ -221,6 +298,7 @@ def hook(raw_command, exit_code, execution_time, start_time, end_time):
 @click.option("--description", "-d", help="命令描述")
 @click.option("--tags", "-t", multiple=True, help="标签")
 def edit(command_id, command, description, tags):
+    _require_runtime()
     """编辑已记忆的命令"""
     try:
         records = storage.get_commands_by_ids([command_id])
@@ -247,7 +325,7 @@ def edit(command_id, command, description, tags):
             record.tags.append(f"desc:{description}")
         
         if tags:
-            record.tags = list(tags)
+            record.tags = builtins.list(tags)
         
         # 更新到数据库
         storage.update_command(record)
@@ -262,6 +340,7 @@ def edit(command_id, command, description, tags):
 @click.argument("command_id")
 @click.confirmation_option(prompt="确定要删除这条命令吗？")
 def delete(command_id):
+    _require_runtime()
     """删除已记忆的命令"""
     try:
         deleted = storage.delete_command(command_id, vector_store=vector_store)
@@ -282,6 +361,7 @@ def workflow():
 @workflow.command("list")
 @click.option("--all", "-a", is_flag=True, help="显示所有共享工作流")
 def workflow_list(all):
+    _require_runtime()
     """列出可用工作流"""
     try:
         from feishu_mem.core.workflow import get_workflow_engine
@@ -311,6 +391,7 @@ def workflow_list(all):
 @click.option("--param", "-p", multiple=True, help="参数，格式: key=value")
 @click.option("--dry-run", is_flag=True, help="只预览执行计划，不实际执行")
 def workflow_run(name, param, dry_run):
+    _require_runtime()
     """执行工作流"""
     try:
         from feishu_mem.core.workflow import get_workflow_engine
@@ -361,6 +442,7 @@ def workflow_run(name, param, dry_run):
 
 @cli.command()
 def stats():
+    _require_runtime()
     """查看系统统计指标"""
     try:
         from feishu_mem.shared.metrics import get_metrics
@@ -406,6 +488,7 @@ def stats():
 
 @cli.command()
 def cleanup():
+    _require_runtime()
     """手动清理过期记忆"""
     try:
         from feishu_mem.core.forgetting_engine import get_forgetting_engine
@@ -426,6 +509,8 @@ def cleanup():
 @cli.command(hidden=True)
 @click.argument("prefix", required=False)
 def completion(prefix=""):
+    if not _ensure_runtime(include_vector=True):
+        sys.exit(0)
     """命令补全接口，供Shell补全系统调用"""
     try:
         if not completion_engine:
@@ -458,6 +543,7 @@ def session():
 @click.option("--limit", "-l", default=10, help="显示数量")
 @click.option("--status", "-s", help="按状态过滤: active/completed/abandoned")
 def session_list(limit, status):
+    _require_runtime()
     """列出最近的会话"""
     try:
         if not session_mgr:
