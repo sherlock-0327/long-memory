@@ -1,0 +1,15 @@
+.idea/
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.pytest-data/
+
+.venv/
+venv/
+env/
+
+*.egg-info/
+dist/
+build/

@@ -100,6 +100,12 @@ class ConfigManager:
         
         if os.getenv("FEISHU_MEM_DATA_DIR"):
             config_kwargs["data_dir"] = Path(os.getenv("FEISHU_MEM_DATA_DIR"))
+
+        if os.getenv("FEISHU_MEM_CACHE_DIR"):
+            config_kwargs["cache_dir"] = Path(os.getenv("FEISHU_MEM_CACHE_DIR"))
+
+        if os.getenv("FEISHU_MEM_LOG_DIR"):
+            config_kwargs["log_dir"] = Path(os.getenv("FEISHU_MEM_LOG_DIR"))
         
         # 加载用户配置文件
         config_file = Path.home() / ".feishu-mem" / "config.json"
