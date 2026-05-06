@@ -77,3 +77,17 @@ END;
 CREATE TRIGGER IF NOT EXISTS commands_fts_delete AFTER DELETE ON commands BEGIN
     DELETE FROM commands_fts WHERE rowid = old.rowid;
 END;
+
+-- 记忆反馈表（参考claude-mem的observation_feedback）
+-- 用于追踪记忆的质量信号，支持价值评估和遗忘决策
+CREATE TABLE IF NOT EXISTS command_feedback (
+    feedback_id TEXT PRIMARY KEY,
+    command_id TEXT NOT NULL,
+    signal_type TEXT NOT NULL,  -- used / useful / useless / corrected
+    context TEXT,               -- 反馈上下文（JSON格式）
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (command_id) REFERENCES commands(command_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_command ON command_feedback(command_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_type ON command_feedback(signal_type);

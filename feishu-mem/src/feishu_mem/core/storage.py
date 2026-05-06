@@ -342,57 +342,11 @@ class Storage:
             return 0
     
     def cleanup_expired_memory(self) -> int:
-        """清理过期记忆，返回删除的数量"""
+        """清理过期记忆，委托给遗忘引擎统一处理，返回删除的数量"""
         try:
-            deleted_count = 0
-            now = datetime.now()
-            
-            with sqlite3.connect(self.db_path, timeout=5) as conn:
-                # 清理临时记忆（7天未使用，非显式）
-                temp_cutoff = (now - timedelta(days=config.temporary_memory_days)).isoformat()
-                cursor = conn.execute(
-                    """
-                    DELETE FROM commands 
-                    WHERE is_explicit = 0 
-                    AND last_used_at < ? 
-                    AND usage_count < 2
-                    """,
-                    (temp_cutoff,)
-                )
-                deleted_count += cursor.rowcount
-                
-                # 清理短期记忆（30天未使用，非显式）
-                short_cutoff = (now - timedelta(days=config.short_term_memory_days)).isoformat()
-                cursor = conn.execute(
-                    """
-                    DELETE FROM commands 
-                    WHERE is_explicit = 0 
-                    AND last_used_at < ? 
-                    AND usage_count < 3
-                    """,
-                    (short_cutoff,)
-                )
-                deleted_count += cursor.rowcount
-                
-                # 清理超过最大保留时间的记忆（非显式）
-                max_cutoff = (now - timedelta(days=config.max_memory_days)).isoformat()
-                cursor = conn.execute(
-                    """
-                    DELETE FROM commands 
-                    WHERE is_explicit = 0 
-                    AND last_used_at < ?
-                    """,
-                    (max_cutoff,)
-                )
-                deleted_count += cursor.rowcount
-                
-                conn.commit()
-                
-                if deleted_count > 0:
-                    logger.info(f"Cleaned up {deleted_count} expired memory entries")
-                
-                return deleted_count
-                
+            from .forgetting_engine import get_forgetting_engine
+            engine = get_forgetting_engine()
+            return engine.auto_cleanup_expired_memory()
         except Exception as e:
             logger.error("Failed to cleanup expired memory", exception=e)
             return 0

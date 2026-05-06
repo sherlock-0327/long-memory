@@ -342,16 +342,17 @@ def test_vector_store_basic(temp_vector_dir):
     
     vec_id = vector_store.add_command(record)
     assert vec_id == "test123"
-    assert vector_store.count() == 1
-    
+    assert vector_store.command_count() == 1  # 唯一命令数为1
+    assert vector_store.count() >= 1  # 文档数>=1（包含细粒度文档）
+
     # 测试搜索
     results = vector_store.search_commands("git push", limit=5)
     assert len(results) > 0
     assert results[0]["command_id"] == "test123"
-    
-    # 测试删除
+
+    # 测试删除（删除命令及所有细粒度文档）
     vector_store.delete_command("test123")
-    assert vector_store.count() == 0
+    assert vector_store.command_count() == 0
 
 def test_task_queue_basic(task_queue):
     """测试异步任务队列基本功能"""

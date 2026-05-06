@@ -1,4 +1,3 @@
-import json
 from datetime import datetime, timedelta
 from typing import List, Tuple
 from dataclasses import dataclass
@@ -7,7 +6,7 @@ import sqlite3
 
 from feishu_mem.shared.config import config
 from feishu_mem.shared.logger import logger
-from .storage import CommandRecord
+from .storage import CommandRecord, Storage
 
 
 @dataclass
@@ -78,29 +77,8 @@ class ForgettingEngine:
                 """, (limit,))
                 
                 for row in cursor.fetchall():
-                    record = CommandRecord(
-                        command_id=row["command_id"],
-                        session_id=row["session_id"],
-                        raw_command=row["raw_command"],
-                        command_name=row["command_name"],
-                        arguments=json.loads(row["arguments"]) if row["arguments"] else [],
-                        options=json.loads(row["options"]) if row["options"] else {},
-                        working_dir=row["working_dir"],
-                        project_id=row["project_id"],
-                        environment=row["environment"],
-                        exit_code=row["exit_code"],
-                        execution_time=row["execution_time"],
-                        executed_at=datetime.fromisoformat(row["executed_at"]),
-                        user_id=row["user_id"],
-                        source=row["source"],
-                        tags=json.loads(row["tags"]) if row["tags"] else [],
-                        is_successful=bool(row["is_successful"]),
-                        sensitivity_level=row["sensitivity_level"],
-                        is_explicit=bool(row["is_explicit"]),
-                        usage_count=row["usage_count"],
-                        last_used_at=datetime.fromisoformat(row["last_used_at"])
-                    )
-                    
+                    record = Storage._row_to_record(row)
+
                     score = self.calculate_memory_score(record)
                     if score.score < threshold:
                         results.append((record, score))

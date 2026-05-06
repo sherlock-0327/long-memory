@@ -10,7 +10,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import uuid
 
@@ -25,7 +25,7 @@ class WorkflowStep:
     step_id: str
     command: str
     description: Optional[str] = None
-    parameters: Dict[str, str] = None  # 参数模板: {参数名: 描述/默认值}
+    parameters: Dict[str, str] = field(default_factory=dict)  # 参数模板: {参数名: 描述/默认值}
     condition: Optional[str] = None  # 执行条件: "last_exit_code == 0"
     continue_on_failure: bool = False
 
@@ -42,7 +42,7 @@ class Workflow:
     updated_at: datetime
     is_shared: bool = False
     team_id: Optional[str] = None
-    tags: List[str] = None
+    tags: List[str] = field(default_factory=list)
     usage_count: int = 0
     last_used_at: Optional[datetime] = None
 
@@ -55,9 +55,9 @@ class WorkflowExecutionResult:
     start_time: datetime
     end_time: Optional[datetime] = None
     status: str = "pending"  # pending/running/completed/failed
-    step_results: List[Dict[str, Any]] = None
+    step_results: List[Dict[str, Any]] = field(default_factory=list)
     error_message: Optional[str] = None
-    parameters_used: Dict[str, Any] = None
+    parameters_used: Dict[str, Any] = field(default_factory=dict)
 
 
 class WorkflowEngine:
@@ -369,13 +369,12 @@ class WorkflowEngine:
         execution_id = str(uuid.uuid4())
         start_time = datetime.now()
         parameters = parameters or {}
-        
+
         result = WorkflowExecutionResult(
             workflow_id=workflow_id,
             execution_id=execution_id,
             start_time=start_time,
             parameters_used=parameters,
-            step_results=[]
         )
         
         try:

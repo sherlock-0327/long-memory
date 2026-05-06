@@ -54,7 +54,7 @@ class LRUCache:
         self.hits += 1
         return entry.value
     
-    def set(self, key: str, value: Any, ttl: int = None) -> None:
+    def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
         """设置缓存值"""
         ttl = ttl or self.default_ttl
         expires_at = time.time() + ttl
@@ -100,7 +100,7 @@ class LRUCache:
 
 class RedisCache:
     """Redis分布式缓存实现"""
-    def __init__(self, host: str = "localhost", port: int = 6379, db: int = 0, password: str = None, default_ttl: int = 3600):
+    def __init__(self, host: str = "localhost", port: int = 6379, db: int = 0, password: Optional[str] = None, default_ttl: int = 3600):
         self.default_ttl = default_ttl
         self.connected = False
         self.client = None
@@ -140,7 +140,7 @@ class RedisCache:
             logger.debug(f"Redis get failed: {e}")
             return None
     
-    def set(self, key: str, value: Any, ttl: int = None) -> None:
+    def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
         """设置缓存值"""
         if not self.connected:
             return
@@ -216,7 +216,7 @@ class MultiLevelCache:
         logger.debug(f"Cache miss for key: {key}")
         return None
     
-    def set(self, key: str, value: Any, ttl: int = None) -> None:
+    def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
         """写入缓存，同时写入L1和L2"""
         self.l1.set(key, value, ttl)
         if self.l2.connected:
@@ -252,8 +252,7 @@ class MultiLevelCache:
         """生成缓存key，自动哈希处理长key"""
         key_content = ":".join(str(p) for p in parts)
         if len(key_content) > 100:
-            # 过长的key用哈希缩短
-            return f"hash:{hashlib.md5(key_content.encode()).hexdigest()}"
+            return f"hash:{hashlib.sha256(key_content.encode()).hexdigest()[:32]}"
         return key_content
 
 

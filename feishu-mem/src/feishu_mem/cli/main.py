@@ -9,36 +9,36 @@ from feishu_mem.core.storage import Storage, CommandRecord
 from feishu_mem.core.collector import CommandCollector
 from feishu_mem.core.completion import CompletionEngine
 from feishu_mem.core.vector_store import VectorStore
+from feishu_mem.core.session_manager import get_session_manager
 from feishu_mem.cli.hooks.installer import HookInstaller
 from feishu_mem.shared.config import config
 from feishu_mem.shared.logger import logger
 
 # 全局实例，支持优雅降级
 try:
-    # 初始化WAL并执行故障恢复
     from feishu_mem.core.wal import get_wal
     wal = get_wal()
-    
+
     storage = Storage()
     vector_store = VectorStore() if config.vector_search_enabled else None
-    
-    # 重放未完成的WAL条目，恢复数据一致性
+
     wal.replay_incomplete(storage, vector_store)
-    
+
     collector = CommandCollector()
     completion_engine = CompletionEngine(storage, vector_store)
     hook_installer = HookInstaller()
-    
+    session_mgr = get_session_manager()
+
     logger.info("Feishu-Mem CLI initialized successfully")
 except Exception as e:
     logger.error("Failed to initialize Feishu-Mem", exception=e)
-    # 初始化失败时设置为None，后续操作优雅降级
     storage = None
     vector_store = None
     wal = None
     collector = None
     completion_engine = None
     hook_installer = None
+    session_mgr = None
 
 @click.group()
 def cli():
@@ -54,6 +54,17 @@ def install():
         click.echo("请重启终端或执行 `source ~/.zshrc`（或对应Shell配置文件）生效。")
     except Exception as e:
         click.echo(f"❌ 安装失败：{str(e)}", err=True)
+        sys.exit(1)
+
+
+@cli.command()
+def uninstall():
+    """卸载Shell钩子"""
+    try:
+        hook_installer.uninstall()
+        click.echo("✅ Feishu-Mem Shell钩子已卸载。")
+    except Exception as e:
+        click.echo(f"❌ 卸载失败：{str(e)}", err=True)
         sys.exit(1)
 
 @cli.command()
@@ -139,20 +150,32 @@ def hook(raw_command, exit_code, execution_time, start_time, end_time):
     # 钩子执行必须保证绝对不崩溃，不影响用户正常使用
     try:
         if not collector or not storage:
-            # 初始化失败时直接退出
             sys.exit(0)
-        
-        # 计算执行时间，如果提供了start和end时间
+
         if start_time and end_time and not execution_time:
             execution_time = max(end_time - start_time, 0)
-        
+
         parsed, context, filtered_command = collector.collect(
-            raw_command, 
-            exit_code=exit_code, 
-            execution_time=execution_time
+            raw_command,
+            exit_code=exit_code,
+            execution_time=execution_time,
         )
-        
-        if parsed.command_name:  # 忽略空命令
+
+        if parsed.command_name:
+            # 获取或创建活跃会话
+            session_id = None
+            if session_mgr:
+                try:
+                    session = session_mgr.get_or_create_active_session(
+                        user_id=context.user_id,
+                        project_id=context.project_id,
+                        environment=context.environment,
+                    )
+                    session_id = session.session_id
+                    session_mgr.record_command(session_id)
+                except Exception:
+                    pass
+
             record = CommandRecord(
                 command_id="",
                 raw_command=filtered_command,
@@ -160,18 +183,32 @@ def hook(raw_command, exit_code, execution_time, start_time, end_time):
                 arguments=parsed.arguments,
                 options=parsed.options,
                 working_dir=context.working_dir,
+                session_id=session_id or context.session_id,
                 project_id=context.project_id,
                 environment=context.environment,
                 exit_code=exit_code,
                 execution_time=execution_time,
-                user_id=context.user_id
+                user_id=context.user_id,
             )
             storage.add_command(record, vector_store)
-            
-        # 定期清理过期记忆（每100次钩子调用执行一次，避免频繁IO）
+
+            # 更新采集指标
+            try:
+                from feishu_mem.shared.metrics import get_metrics
+                get_metrics().counter_inc("command_collected_total")
+            except Exception:
+                pass
+
+        # 定期清理过期记忆（每100次钩子调用执行一次）
         import random
         if random.randint(1, 100) == 1:
             storage.cleanup_expired_memory()
+            # 清理僵尸会话
+            if session_mgr:
+                try:
+                    session_mgr.abandon_stale_sessions()
+                except Exception:
+                    pass
             
     except Exception as e:
         # 钩子执行失败时静默退出，绝对不影响用户正常使用
@@ -410,6 +447,44 @@ def completion(prefix=""):
     except Exception:
         # 补全接口绝对不允许崩溃，避免影响用户输入体验
         sys.exit(0)
+
+@cli.group()
+def session():
+    """会话管理命令"""
+    pass
+
+
+@session.command("list")
+@click.option("--limit", "-l", default=10, help="显示数量")
+@click.option("--status", "-s", help="按状态过滤: active/completed/abandoned")
+def session_list(limit, status):
+    """列出最近的会话"""
+    try:
+        if not session_mgr:
+            click.echo("会话管理器未初始化")
+            sys.exit(1)
+
+        user_id = os.getenv("USER") or os.getenv("USERNAME") or "unknown"
+        sessions = session_mgr.get_user_sessions(user_id, limit=limit, status=status)
+
+        if not sessions:
+            click.echo("还没有会话记录")
+            return
+
+        click.echo(f"最近 {len(sessions)} 个会话：")
+        for i, s in enumerate(sessions, 1):
+            status_icon = {"active": "🟢", "completed": "✅", "abandoned": "⚠️"}.get(s["status"], "❓")
+            duration_min = s["duration_seconds"] / 60
+            click.echo(
+                f"{i:2d}. {status_icon} [{s['status']}] "
+                f"命令数: {s['command_count']}, "
+                f"时长: {duration_min:.1f}分钟, "
+                f"开始: {s['started_at']}"
+            )
+    except Exception as e:
+        click.echo(f"获取会话列表失败：{str(e)}", err=True)
+        sys.exit(1)
+
 
 @cli.command()
 def version():
